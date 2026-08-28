@@ -106,7 +106,9 @@ User Action → Freighter Signing → Soroban TX → OphirPayContract
 | Instance storage | Contract instance | 50,000 ledgers | Counters, config, owner, paused flag |
 | Persistent storage | Contract ledger | 50,000 ledgers per entry | Payments, escrows, streams, batches, audit entries |
 
-All writes call `extend_ttl(5000, 50000)` to prevent archival.
+All writes call `extend_ttl(5000, 50000)` to prevent archival. A maintenance function (`maintain_storage_bump`) allows the owner to bump old entries that haven't been written to recently.
+
+For details, see [STORAGE-BUMP.md](STORAGE-BUMP.md).
 
 ### 4. Security Model
 

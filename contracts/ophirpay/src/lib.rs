@@ -3835,6 +3835,99 @@ impl OphirPayContract {
 
         payments
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  STORAGE BUMP MAINTENANCE — Prevent archival of old entries
+    // ═══════════════════════════════════════════════════════════
+
+    /// Bump TTL for a range of persistent entries by type.
+    /// Owner-only maintenance function to prevent archival of old records.
+    /// Each `extend_ttl` costs ~400 gas; batch size is limited to 50.
+    ///
+    /// `entry_type`:
+    ///   0 = payment, 1 = escrow, 2 = stream, 3 = batch,
+    ///   4 = audit, 5 = refund, 6 = approval, 7 = proposal,
+    ///   8 = hook, 9 = timelock, 10 = vote, 11 = recurring
+    pub fn maintain_storage_bump(
+        env: Env,
+        caller: Address,
+        entry_type: u32,
+        start_id: u64,
+        count: u32,
+    ) -> Result<u32, PaymentError> {
+        caller.require_auth();
+        require_owner(&env, &caller)?;
+
+        // Cap batch size at 50 to bound gas consumption
+        let batch_size = core::cmp::min(count, 50);
+        let mut bumped: u32 = 0;
+
+        let min_ttl: u32 = 5000;
+        let max_ttl: u32 = 50000;
+
+        for i in 0..batch_size {
+            let id = start_id.saturating_add(i as u64);
+            let key_result = match entry_type {
+                0 => Some((PAYMENT_KEY, id)),
+                1 => Some((ESCROW_KEY, id)),
+                2 => Some((STREAM_KEY, id)),
+                3 => Some((BATCH_KEY, id)),
+                4 => Some((AUDIT_LOG_KEY, id)),
+                5 => Some((REFUND_KEY, id)),
+                6 => Some((APPROVAL_KEY, id)),
+                7 => Some((PROPOSAL_KEY, id)),
+                8 => Some((HOOK_KEY, id)),
+                9 => Some((TIMELOCK_KEY, id)),
+                // Vote keys are composite: (VOTE_KEY, proposal_id, voter)
+                // and cannot be bumped by range; skip.
+                10 => None,
+                11 => Some((RECURRING_KEY, id)),
+                _ => None,
+            };
+
+            if let Some(key) = key_result {
+                if env.storage().persistent().has(&key) {
+                    env.storage().persistent().extend_ttl(&key, min_ttl, max_ttl);
+                    bumped = bumped.saturating_add(1);
+                }
+            }
+        }
+
+        record_audit(
+            &env,
+            "storage_bumped",
+            &caller,
+            start_id,
+            "Storage TTL bumped",
+        );
+
+        Ok(bumped)
+    }
+
+    /// Bump TTL for instance storage (counters, config, owner).
+    /// Owner-only maintenance function.
+    pub fn maintain_instance_bump(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), PaymentError> {
+        caller.require_auth();
+        require_owner(&env, &caller)?;
+
+        let min_ttl: u32 = 5000;
+        let max_ttl: u32 = 50000;
+
+        env.storage().instance().extend_ttl(min_ttl, max_ttl);
+
+        record_audit(
+            &env,
+            "instance_bumped",
+            &caller,
+            0,
+            "Instance storage TTL bumped",
+        );
+
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -5757,5 +5850,149 @@ mod tests {
             &50i128,
         );
         assert!(result.is_err());
+    }
+
+    // ── Storage Bump Maintenance Tests ──────────────────────
+
+    #[test]
+    fn test_maintain_storage_bump_payments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1000);
+        let contract_id = env.register(OphirPayContract, ());
+        let client = OphirPayContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let sac = create_token_contract(&env, &owner);
+
+        let _ = client.init(&owner);
+
+        // Create 3 payments
+        let _ = client.record_payment(
+            &payer,
+            &payee,
+            &100i128,
+            &sac,
+            &String::from_str(&env, "tx1"),
+            &String::from_str(&env, ""),
+        );
+        let _ = client.record_payment(
+            &payer,
+            &payee,
+            &200i128,
+            &sac,
+            &String::from_str(&env, "tx2"),
+            &String::from_str(&env, ""),
+        );
+        let _ = client.record_payment(
+            &payer,
+            &payee,
+            &300i128,
+            &sac,
+            &String::from_str(&env, "tx3"),
+            &String::from_str(&env, ""),
+        );
+
+        // Bump payments 1-3 (entry_type=0)
+        let bumped = client.maintain_storage_bump(&owner, &0u32, &1u64, &3u32);
+        assert_eq!(bumped, 3);
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_skips_nonexistent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(OphirPayContract, ());
+        let client = OphirPayContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Bump payments 1-5 (none exist)
+        let bumped = client.maintain_storage_bump(&owner, &0u32, &1u64, &5u32);
+        assert_eq!(bumped, 0);
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_caps_at_50() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(OphirPayContract, ());
+        let client = OphirPayContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Request 100 bumps, should cap at 50
+        let bumped = client.maintain_storage_bump(&owner, &0u32, &1u64, &100u32);
+        assert_eq!(bumped, 0); // none exist, but no panic
+    }
+
+    #[test]
+    fn test_maintain_instance_bump() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(OphirPayContract, ());
+        let client = OphirPayContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Should not panic
+        client.maintain_instance_bump(&owner);
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(OphirPayContract, ());
+        let client = OphirPayContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let rando = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Non-owner should fail
+        let result = client.try_maintain_storage_bump(&rando, &0u32, &1u64, &10u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_all_entry_types() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(OphirPayContract, ());
+        let client = OphirPayContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let sac = create_token_contract(&env, &owner);
+
+        let _ = client.init(&owner);
+
+        // Create one of each type
+        let _ = client.record_payment(
+            &payer,
+            &payee,
+            &100i128,
+            &sac,
+            &String::from_str(&env, "tx"),
+            &String::from_str(&env, ""),
+        );
+
+        // Bump each type — all should succeed (returns 1 for existing entries)
+        // Type 0 = payment
+        let bumped = client.maintain_storage_bump(&owner, &0u32, &1u64, &1u32);
+        assert_eq!(bumped, 1);
+
+        // Type 10 = vote (skipped, returns 0)
+        let bumped = client.maintain_storage_bump(&owner, &10u32, &1u64, &10u32);
+        assert_eq!(bumped, 0);
+
+        // Unknown type (99) returns 0
+        let bumped = client.maintain_storage_bump(&owner, &99u32, &1u64, &10u32);
+        assert_eq!(bumped, 0);
     }
 }

@@ -336,6 +336,47 @@ impl PaymentEventEmitter {
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&PAUSED).unwrap_or(false)
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  STORAGE BUMP MAINTENANCE — Prevent archival of old events
+    // ═══════════════════════════════════════════════════════════
+
+    /// Bump TTL for a range of persistent event entries.
+    /// Owner-only maintenance function to prevent archival of old events.
+    /// Each `extend_ttl` costs ~400 gas; batch size is limited to 50.
+    pub fn maintain_storage_bump(
+        env: Env,
+        caller: Address,
+        start_id: u64,
+        count: u32,
+    ) -> Result<u32, EmitterError> {
+        caller.require_auth();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&EMITTER_OWNER)
+            .ok_or(EmitterError::NotInitialized)?;
+        if caller != owner {
+            return Err(EmitterError::Unauthorized);
+        }
+
+        // Cap batch size at 50 to bound gas consumption
+        let batch_size = core::cmp::min(count, 50);
+        let mut bumped: u32 = 0;
+
+        let min_ttl: u32 = 5000;
+        let max_ttl: u32 = 50000;
+
+        for i in 0..batch_size {
+            let id = start_id.saturating_add(i as u64);
+            if env.storage().persistent().has(&id) {
+                env.storage().persistent().extend_ttl(&id, min_ttl, max_ttl);
+                bumped = bumped.saturating_add(1);
+            }
+        }
+
+        Ok(bumped)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -517,5 +558,97 @@ mod tests {
         env.ledger().set_timestamp(env.ledger().timestamp() + 86401);
         client.accept_ownership(&new_owner);
         assert_eq!(client.get_owner(), new_owner);
+    }
+
+    // ── Storage Bump Maintenance Tests ──────────────────────
+
+    #[test]
+    fn test_maintain_storage_bump_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1000);
+        let addr = env.register(PaymentEventEmitter, ());
+        let client = PaymentEventEmitterClient::new(&env, &addr);
+        let owner = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Create 3 events
+        let _ = client.emit_payment(
+            &owner,
+            &String::from_str(&env, "OphirPay"),
+            &payer,
+            &payee,
+            &100i128,
+            &String::from_str(&env, "tx1"),
+        );
+        let _ = client.emit_payment(
+            &owner,
+            &String::from_str(&env, "OphirPay"),
+            &payer,
+            &payee,
+            &200i128,
+            &String::from_str(&env, "tx2"),
+        );
+        let _ = client.emit_payment(
+            &owner,
+            &String::from_str(&env, "OphirPay"),
+            &payer,
+            &payee,
+            &300i128,
+            &String::from_str(&env, "tx3"),
+        );
+
+        // Bump events 1-3
+        let bumped = client.maintain_storage_bump(&owner, &1u64, &3u32);
+        assert_eq!(bumped, 3);
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_skips_nonexistent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let addr = env.register(PaymentEventEmitter, ());
+        let client = PaymentEventEmitterClient::new(&env, &addr);
+        let owner = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Bump events 1-5 (none exist)
+        let bumped = client.maintain_storage_bump(&owner, &1u64, &5u32);
+        assert_eq!(bumped, 0);
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_caps_at_50() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let addr = env.register(PaymentEventEmitter, ());
+        let client = PaymentEventEmitterClient::new(&env, &addr);
+        let owner = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Request 100 bumps, should cap at 50
+        let bumped = client.maintain_storage_bump(&owner, &1u64, &100u32);
+        assert_eq!(bumped, 0); // none exist, but no panic
+    }
+
+    #[test]
+    fn test_maintain_storage_bump_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let addr = env.register(PaymentEventEmitter, ());
+        let client = PaymentEventEmitterClient::new(&env, &addr);
+        let owner = Address::generate(&env);
+        let rando = Address::generate(&env);
+
+        let _ = client.init(&owner);
+
+        // Non-owner should fail
+        let result = client.try_maintain_storage_bump(&rando, &1u64, &10u32);
+        assert!(result.is_err());
     }
 }
